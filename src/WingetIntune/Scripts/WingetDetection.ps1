@@ -1,138 +1,245 @@
-﻿# WinTuner - Winget Detection script https://wintuner.app
-# 
+# WinTuner VCIO - Winget Detection script
+#
 # Script parameters in `{parameter_name}`
 # packageId - The package id of the application to be detected
-# version - The version of the application to be detected
+# version   - The minimum version of the application to be detected
 
 # --------------------------- Start parameters -------------------------------
 $packageId = "{packageId}"
-$version = "{version}"
+$version   = "{version}"
 # --------------------------- End parameters ---------------------------------
 
-# ------------------------------------Start script, do not edit below -----------------------------------------
+# ------------------------------------ Start script -----------------------------------------
 Start-Transcript -Path "$env:ProgramData\Microsoft\IntuneManagementExtension\Logs\$packageId-detection.log" -Force
-Write-Host "Starting $packageId $version detection"
+Write-Host "Starting detection for packageId='$packageId' version='$version'"
 
-# Need to get the full path of winget, because detection script is run in a different context
-Function Get-WingetCmd {
+#region Helper functions
 
-    $WingetCmd = $null
-    #Get WinGet Path
+function Get-WingetCmd {
+    Write-Host "Resolving winget.exe path"
 
-    try {
-        # Get Admin Context Winget Location
-        $WingetInfo = (Get-Item "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_*_8wekyb3d8bbwe\winget.exe").VersionInfo | Sort-Object -Property FileVersionRaw
-        # if multiple versions, pick most recent one
-        $WingetCmd = $WingetInfo[-1].FileName
+    # Prefer whatever is on PATH
+    $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue
+    if ($cmd) {
+        Write-Host "Found winget on PATH at '$($cmd.Source)'"
+        return $cmd.Source
     }
-    catch {
-        #Get User context Winget Location
-        if (Test-Path "$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe")
-        {
-            $WingetCmd ="$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe"
+
+    # Fallbacks in case PATH lookup fails (rare on modern Windows, but cheap to try)
+    $possible = @(
+        "$env:ProgramFiles\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe",
+        "$env:LocalAppData\Microsoft\WindowsApps\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\winget.exe"
+    )
+
+    foreach ($path in $possible) {
+        if (Test-Path $path) {
+            Write-Host "Found winget at '$path'"
+            return $path
         }
     }
-    Write-Host "Winget location: $WingetCmd"
-    return $WingetCmd
+
+    Write-Host "winget.exe not found in PATH or known locations"
+    return $null
 }
 
-# Convert command output to array of values
-Function Get-ColumnValuesFromWingetOutput {
-    param (
-        [array]$Output
+function Compare-Versions {
+    param(
+        [Parameter(Mandatory)]
+        [string] $VersionExpected,
+        [Parameter(Mandatory)]
+        [string] $VersionInstalled
     )
-    if ($Output -is [string]) {
-        return @($Output) # Convert single string to array
+
+    # Returns:
+    #  0  -> equal
+    #  1  -> installed is higher than expected
+    # -1  -> installed is lower than expected
+
+    if ([string]::IsNullOrWhiteSpace($VersionExpected) -or
+        [string]::IsNullOrWhiteSpace($VersionInstalled)) {
+        return 0
     }
 
-    if ($Output -is [array] -and $Output.Length -gt 2) {
-        # $Output is an array, first row is header, last row is data
-        # this will break if multiple lines are returned, but that should not happen with --exact
-        #$headerRow = $Output[$Output.Length - 3]
-        $headerRow = $Output | Where-Object { $_ -match '^[A-Za-z]' } | Select-Object -First 1
-        $lastRow = $Output[$Output.Length - 1]
-
-        # Find the start index of each column by searching for non-space transitions
-        $columnStarts = @()
-        for ($i = 0; $i -lt $headerRow.Length; $i++) {
-            if (($i -eq 0 -or $headerRow[$i - 1] -eq ' ') -and $headerRow[$i] -ne ' ') {
-                $columnStarts += $i
-            }
-        }
-
-        # Add the end of the line as the last column boundary
-        $columnStarts += $lastRow.Length
-
-        # Extract column values from the data row
-        $columns = @()
-        for ($i = 0; $i -lt $columnStarts.Count - 1; $i++) {
-            $start = $columnStarts[$i]
-            $length = $columnStarts[$i + 1] - $start
-            $columns += $lastRow.Substring($start, $length).Trim()
-        }
-
-        return $columns
-    }
-    else {
-        Write-Host "Unexpected output format from winget list command"
-        return @()
-    }
-}
-
-Function Compare-Versions {
-    param (
-        [string]$VersionExpected,
-        [string]$VersionInstalled
-    )
     try {
-        $vi = [version]$VersionInstalled
-        $ve = [version]$VersionExpected
-        return $vi.CompareTo($ve)
+        $vExpected  = [version]$VersionExpected
+        $vInstalled = [version]$VersionInstalled
+
+        if ($vInstalled -gt $vExpected) { return 1 }
+        if ($vInstalled -lt $vExpected) { return -1 }
+        return 0
     } catch {
-        # Fallback to string comparison if version parsing fails
-        return $VersionInstalled.CompareTo($VersionExpected)
+        # Fallback to string comparison when .NET version parsing cannot handle the format
+        if ($VersionInstalled -eq $VersionExpected) { return 0 }
+        if ($VersionInstalled -gt $VersionExpected) { return 1 }
+        return -1
     }
 }
+
+function Get-WingetPackageFromJson {
+    param(
+        [Parameter(Mandatory)]
+        [string] $WingetCmd,
+        [Parameter(Mandatory)]
+        [string] $PackageId
+    )
+
+    Write-Host "Querying winget (JSON) for packageId='$PackageId'"
+
+    $raw = & $WingetCmd list --id $PackageId --exact --accept-source-agreements --output json 2>$null | Out-String
+    if (-not $raw.Trim()) {
+        Write-Host "No JSON output from 'winget list --id $PackageId --exact'"
+        return $null
+    }
+
+    try {
+        $data = $raw | ConvertFrom-Json
+    } catch {
+        Write-Host "Failed to parse winget JSON output: $($_.Exception.Message)"
+        return $null
+    }
+
+    if (-not $data) {
+        Write-Host "No entries returned in JSON for packageId='$PackageId'"
+        return $null
+    }
+
+    # winget list can return a single object or an array
+    if ($data -is [System.Array]) {
+        $pkg = $data | Select-Object -First 1
+    } else {
+        $pkg = $data
+    }
+
+    Write-Host "JSON detection candidate: Name='$($pkg.Name)' Id='$($pkg.Id)' Version='$($pkg.Version)'"
+    return $pkg
+}
+
+function Get-WingetPackageLegacy {
+    param(
+        [Parameter(Mandatory)]
+        [string] $WingetCmd,
+        [Parameter(Mandatory)]
+        [string] $PackageId
+    )
+
+    Write-Host "Falling back to legacy text parsing for packageId='$PackageId'"
+
+    $output = & $WingetCmd list --id $PackageId --exact --accept-source-agreements 2>$null
+    if (-not $output) {
+        Write-Host "No text output from 'winget list --id $PackageId --exact'"
+        return $null
+    }
+
+    $lines = $output | Where-Object { $_.Trim() }
+    if ($lines.Count -lt 2) {
+        Write-Host "Not enough lines in winget output to parse (got $($lines.Count))"
+        return $null
+    }
+
+    # Last non-empty line is the one with the package
+    $header = $lines[0]
+    $data   = $lines[-1]
+
+    # Detect approximate column positions from the header
+    $nameStart = 0
+    $idStart   = $header.IndexOf("Id", [StringComparison]::OrdinalIgnoreCase)
+    $verStart  = $header.IndexOf("Version", [StringComparison]::OrdinalIgnoreCase)
+
+    if ($idStart -lt 0 -or $verStart -lt 0) {
+        Write-Host "Could not identify Id/Version columns in winget output header"
+        return $null
+    }
+
+    $name  = $data.Substring($nameStart, $idStart - $nameStart).Trim()
+    $id    = $data.Substring($idStart,   $verStart - $idStart).Trim()
+    $ver   = $data.Substring($verStart).Trim().Split(" ", 2)[0]
+
+    $obj = [PSCustomObject]@{
+        Name    = $name
+        Id      = $id
+        Version = $ver
+        Source  = $null
+    }
+
+    Write-Host "Legacy detection candidate: Name='$($obj.Name)' Id='$($obj.Id)' Version='$($obj.Version)'"
+    return $obj
+}
+
+#endregion Helper functions
+
+#region Main
 
 $wingetCmd = Get-WingetCmd
-if ($null -eq $wingetCmd) {
-    Write-Host "winget not detected, exiting with code 1"
-    Exit 1
+if (-not $wingetCmd) {
+    Write-Host "winget.exe not available, exiting with code 10"
+    Exit 10
 }
 
-$wingetOutput = & $wingetCmd "list" "--id" $packageId "--exact" "--accept-source-agreements"
+# 1) Try strict Id lookup with JSON
+$pkg = Get-WingetPackageFromJson -WingetCmd $wingetCmd -PackageId $packageId
 
-if($wingetOutput -is [array]) { # the output will be either an array of lines or a string when it is just one line.
+# 2) If JSON-by-Id fails, try a broader JSON search by name/id
+if (-not $pkg) {
+    Write-Host "JSON lookup by Id failed, trying broader search by Id/Name"
 
-    $columns = Get-ColumnValuesFromWingetOutput -Output $wingetOutput
-    if ($columns.Length -lt 4) {
-        Write-Host "Got invalid column count $($columns.Length) expected at least 4, exiting with code 10"
-        Write-Host "Winget output:"
-        Write-Host "$($wingetOutput)"
-        Exit 10
-    }
-
-    if ($columns[1] -eq $packageId) {
-        if ($null -eq $version -or $version -eq "") {
-            Write-Host "$($packageId) version $($columns[2]) is installed, exiting with code 0"
-            Exit 0
+    $rawSearch = & $wingetCmd list $packageId --accept-source-agreements --output json 2>$null | Out-String
+    if ($rawSearch.Trim()) {
+        try {
+            $dataSearch = $rawSearch | ConvertFrom-Json
+        } catch {
+            $dataSearch = $null
+            Write-Host "Failed to parse JSON for broader search: $($_.Exception.Message)"
         }
-        if ($columns[2] -eq $version) {
-            Write-Host "$($packageId) version $($version) is installed, exiting with code 0"
-            Exit 0
-        }
-        $versionValue = Compare-Versions -VersionExpected $version -VersionInstalled $columns[2]
-        if ($versionValue -lt 0) {
-            Write-Host "$($packageId) is installed but $($columns[2]) is lower than expected $($version), exit code 4"
-            Exit 4
-        } else {
-            Write-Host "$($packageId) is installed $($columns[2]) is equal of higher than expected $($version), exit code 0"
-            Exit 0
+
+        if ($dataSearch) {
+            if ($dataSearch -is [System.Array]) {
+                $pkg = $dataSearch | Where-Object { $_.Id -eq $packageId -or $_.Name -eq $packageId } | Select-Object -First 1
+            } else {
+                if ($dataSearch.Id -eq $packageId -or $dataSearch.Name -eq $packageId) {
+                    $pkg = $dataSearch
+                }
+            }
+
+            if ($pkg) {
+                Write-Host "Found package via broader JSON search: Name='$($pkg.Name)' Id='$($pkg.Id)' Version='$($pkg.Version)'"
+            }
         }
     }
 }
 
-Write-Host "$($packageId) not detected using winget, exiting with code 10"
-Write-Host "Winget output:"
-Write-Host "$($wingetOutput)"
-Exit 10
+# 3) If JSON completely fails, fall back to legacy text parsing
+if (-not $pkg) {
+    $pkg = Get-WingetPackageLegacy -WingetCmd $wingetCmd -PackageId $packageId
+}
+
+if (-not $pkg) {
+    Write-Host "Package '$packageId' not detected using winget, exiting with code 10"
+    Exit 10
+}
+
+$installedVersion = [string]$pkg.Version
+Write-Host "Detected installed version '$installedVersion' for packageId='$packageId'"
+
+# If no version was provided, any installed version is success
+if ([string]::IsNullOrWhiteSpace($version)) {
+    Write-Host "No expected version specified, package is installed, exiting with code 0"
+    Exit 0
+}
+
+$cmp = Compare-Versions -VersionExpected $version -VersionInstalled $installedVersion
+
+if ($cmp -lt 0) {
+    Write-Host "Installed version '$installedVersion' is lower than expected '$version', exiting with code 4"
+    Exit 4
+}
+
+if ($cmp -eq 0) {
+    Write-Host "Installed version '$installedVersion' equals expected '$version', exiting with code 0"
+    Exit 0
+}
+
+# cmp > 0 -> installed is higher than expected
+Write-Host "Installed version '$installedVersion' is higher than expected '$version', treating as compliant, exiting with code 0"
+Exit 0
+
+#endregion Main
